@@ -17,9 +17,6 @@ import (
 	_ "image/png"
 
 	"go/parser"
-	"go/token"
-	"math"
-	"reflect"
 )
 
 const (
@@ -51,9 +48,9 @@ func main() {
 	}
 
 	// Define shader expressions here — can be dynamic or loaded from CLI/config
-	rExpr := "(x + frame) % 255"
-	gExpr := "(y + frame) % 255"
-	bExpr := "(x * y / (frame + 1)) % 255"
+	rExpr := "(x*y + frame) % 255"
+	gExpr := "(y*y + frame) % 255"
+	bExpr := "(x*x / (frame + 1)) % 255"
 	aExpr := "255"
 
 	fmt.Println("Generating shader frames...")
