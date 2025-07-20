@@ -1,7 +1,7 @@
 blended_frames
 input_frames
+shader_frames
 output
-input
 
 src/main
 src/main.o

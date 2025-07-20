@@ -1,18 +1,17 @@
 package main
 
 import (
-	"bytes"
 	"fmt"
 	"image"
 	"image/draw"
 	"image/png"
+	"image/color"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	_ "image/jpeg"
 	_ "image/png"
@@ -93,12 +92,12 @@ func simulateShaderRender(frameIndex, width, height int, outPath string) error {
 	img := image.NewRGBA(image.Rect(0, 0, width, height))
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
-			img.Set(x, y, image.RGBAColor{
-				R: uint8((x + frameIndex) % 255),
-				G: uint8((y + frameIndex) % 255),
-				B: uint8((x * y / (frameIndex + 1)) % 255),
-				A: 255,
-			})
+			img.Set(x, y, color.RGBA{
+			R: uint8((x + frameIndex) % 255),
+			G: uint8((y + frameIndex) % 255),
+			B: uint8((x * y / (frameIndex + 1)) % 255),
+			A: 255,
+		})
 		}
 	}
 	return saveImage(outPath, img)
