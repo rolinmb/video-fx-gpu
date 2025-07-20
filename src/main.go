@@ -3,225 +3,167 @@ package main
 import (
 	"fmt"
 	"image"
-	"image/draw"
 	"image/png"
-	"image/color"
-	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
-	"strings"
+	"runtime"
 
-	_ "image/jpeg"
-	_ "image/png"
-
-	"go/parser"
+	"github.com/go-gl/gl/v3.3-core/gl"
+	"github.com/go-gl/glfw/v3.3/glfw"
 )
 
 const (
-	inputVideo     = "input.mp4"
-	inputFrameDir  = "input_frames"
-	shaderFrameDir = "shader_frames"
-	blendedDir     = "blended_frames"
-	outputVideo    = "output/output.mp4"
-	frameRate      = 30
+	width       = 512
+	height      = 512
+	frameCount  = 60
+	outputDir   = "shader_frames"
+	vertexSrc   = `
+#version 330 core
+out vec2 uv;
+void main() {
+	float x = float((gl_VertexID << 1) & 2);
+	float y = float(gl_VertexID & 2);
+	uv = vec2(x, y);
+	gl_Position = vec4(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+}`
 )
 
+// Dynamic shader expression (replace these dynamically)
+var redExpr = "0.5 + 0.5 * sin(time)"
+var greenExpr = "0.5 + 0.5 * cos(time)"
+var blueExpr = "0.5 + 0.5 * sin(time * 0.5)"
+
+func init() {
+	runtime.LockOSThread()
+}
+
 func main() {
-	ensureDirs()
-
-	fmt.Println("Extracting frames from input.mp4...")
-	if err := runFFmpegExtract(); err != nil {
-		log.Fatalf("ffmpeg extract error: %v", err)
+	if err := glfw.Init(); err != nil {
+		panic(err)
 	}
+	defer glfw.Terminate()
 
-	fmt.Println("Detecting frame size...")
-	width, height, err := getFrameSize()
+	glfw.WindowHint(glfw.Visible, glfw.False) // Offscreen rendering
+	glfw.WindowHint(glfw.ContextVersionMajor, 3)
+	glfw.WindowHint(glfw.ContextVersionMinor, 3)
+	glfw.WindowHint(glfw.OpenGLProfile, glfw.OpenGLCoreProfile)
+
+	window, err := glfw.CreateWindow(width, height, "ShaderRenderer", nil, nil)
 	if err != nil {
-		log.Fatalf("cannot detect size: %v", err)
+		panic(err)
+	}
+	window.MakeContextCurrent()
+
+	if err := gl.Init(); err != nil {
+		panic(err)
 	}
 
-	files, err := os.ReadDir(inputFrameDir)
-	if err != nil {
-		log.Fatalf("read frame count: %v", err)
+	shaderSrc := fmt.Sprintf(`
+#version 330 core
+in vec2 uv;
+out vec4 fragColor;
+uniform float time;
+void main() {
+	float r = %s;
+	float g = %s;
+	float b = %s;
+	fragColor = vec4(r, g, b, 1.0);
+}
+`, redExpr, greenExpr, blueExpr)
+
+	prog := createProgram(vertexSrc, shaderSrc)
+	gl.UseProgram(prog)
+
+	timeLoc := gl.GetUniformLocation(prog, gl.Str("time\x00"))
+
+	// Framebuffer + Texture
+	var fbo, tex uint32
+	gl.GenFramebuffers(1, &fbo)
+	gl.BindFramebuffer(gl.FRAMEBUFFER, fbo)
+
+	gl.GenTextures(1, &tex)
+	gl.BindTexture(gl.TEXTURE_2D, tex)
+	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, nil)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST)
+	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST)
+	gl.FramebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0)
+
+	if gl.CheckFramebufferStatus(gl.FRAMEBUFFER) != gl.FRAMEBUFFER_COMPLETE {
+		panic("Framebuffer is not complete")
 	}
 
-	// Define shader expressions here — can be dynamic or loaded from CLI/config
-	rExpr := "(x*y + frame) % 255"
-	gExpr := "(y*y + frame) % 255"
-	bExpr := "(x*x / (frame + 1)) % 255"
-	aExpr := "255"
+	// Render & Save
+	os.MkdirAll(outputDir, 0755)
 
-	fmt.Println("Generating shader frames...")
-	if err := runShaderFrameGen(len(files), width, height, rExpr, gExpr, bExpr, aExpr); err != nil {
-		log.Fatalf("shader frame gen error: %v", err)
-	}
-
-	fmt.Println("Blending frames...")
-	if err := blendAllFrames(); err != nil {
-		log.Fatalf("blend error: %v", err)
-	}
-
-	fmt.Println("Re-encoding output video...")
-	if err := runFFmpegAssemble(outputVideo, filepath.Join(blendedDir, "blend_%04d.png"), frameRate); err != nil {
-		log.Fatalf("ffmpeg assemble error: %v", err)
-	}
-
-	fmt.Println("Done!")
-}
-
-func runFFmpegExtract() error {
-	cmd := exec.Command("ffmpeg", "-i", inputVideo, filepath.Join(inputFrameDir, "frame_%04d.png"))
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func runFFmpegAssemble(output string, inputPattern string, fps int) error {
-	cmd := exec.Command("ffmpeg", "-framerate", strconv.Itoa(fps), "-i", inputPattern, "-c:v", "libx264", "-pix_fmt", "yuv420p", output)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
-func blendImages(img1, img2 image.Image) image.Image {
-	out := image.NewRGBA(img1.Bounds())
-	draw.Draw(out, img1.Bounds(), img1, image.Point{}, draw.Over)
-	draw.Draw(out, img2.Bounds(), img2, image.Point{}, draw.Over) // change to draw.Src for hard replace
-	return out
-}
-
-func loadImage(path string) (image.Image, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-	img, _, err := image.Decode(file)
-	return img, err
-}
-
-func saveImage(path string, img image.Image) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return png.Encode(f, img)
-}
-
-func ensureDirs() {
-	os.MkdirAll(inputFrameDir, 0755)
-	os.MkdirAll(shaderFrameDir, 0755)
-	os.MkdirAll(blendedDir, 0755)
-	os.MkdirAll("output", 0755)
-}
-
-func runShaderFrameGen(frameCount int, width, height int, rExpr, gExpr, bExpr, aExpr string) error {
 	for i := 0; i < frameCount; i++ {
-		filename := fmt.Sprintf(filepath.Join(shaderFrameDir, "shader_%04d.png"), i+1)
-		fmt.Println("Generating shader frame:", filename)
-		err := simulateShaderRender(i, width, height, filename, rExpr, gExpr, bExpr, aExpr)
+		t := float32(i) / float32(frameCount)
+		gl.Viewport(0, 0, width, height)
+		gl.ClearColor(0, 0, 0, 1)
+		gl.Clear(gl.COLOR_BUFFER_BIT)
+		gl.Uniform1f(timeLoc, t*6.28) // full cycle of sin/cos
+		gl.DrawArrays(gl.TRIANGLES, 0, 3)
+
+		img := readPixels(width, height)
+		outFile := filepath.Join(outputDir, fmt.Sprintf("shader_%04d.png", i))
+		f, err := os.Create(outFile)
 		if err != nil {
-			return err
+			panic(err)
 		}
+		if err := png.Encode(f, img); err != nil {
+			panic(err)
+		}
+		f.Close()
+		fmt.Println("Wrote", outFile)
 	}
-	return nil
 }
 
+func createProgram(vsSrc, fsSrc string) uint32 {
+	vs := compileShader(vsSrc, gl.VERTEX_SHADER)
+	fs := compileShader(fsSrc, gl.FRAGMENT_SHADER)
+	prog := gl.CreateProgram()
+	gl.AttachShader(prog, vs)
+	gl.AttachShader(prog, fs)
+	gl.LinkProgram(prog)
 
-func simulateShaderRender(frameIndex, width, height int, outPath string, rExprStr, gExprStr, bExprStr, aExprStr string) error {
-	rExpr, err := parser.ParseExpr(rExprStr)
-	if err != nil {
-		return err
+	var status int32
+	gl.GetProgramiv(prog, gl.LINK_STATUS, &status)
+	if status == gl.FALSE {
+		var logLength int32
+		gl.GetProgramiv(prog, gl.INFO_LOG_LENGTH, &logLength)
+		log := make([]byte, logLength+1)
+		gl.GetProgramInfoLog(prog, logLength, nil, &log[0])
+		panic(fmt.Sprintf("Shader link error: %s", log))
 	}
-	gExpr, err := parser.ParseExpr(gExprStr)
-	if err != nil {
-		return err
-	}
-	bExpr, err := parser.ParseExpr(bExprStr)
-	if err != nil {
-		return err
-	}
-	aExpr, err := parser.ParseExpr(aExprStr)
-	if err != nil {
-		return err
-	}
-
-	img := image.NewRGBA(image.Rect(0, 0, width, height))
-
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			vars := map[string]int{
-				"x":     x,
-				"y":     y,
-				"frame": frameIndex,
-			}
-
-			r, _ := evalExprTreeNode(rExpr, vars)
-			g, _ := evalExprTreeNode(gExpr, vars)
-			b, _ := evalExprTreeNode(bExpr, vars)
-			a, _ := evalExprTreeNode(aExpr, vars)
-
-			img.Set(x, y, color.RGBA{
-				R: clampToByte(r),
-				G: clampToByte(g),
-				B: clampToByte(b),
-				A: clampToByte(a),
-			})
-		}
-	}
-
-	return saveImage(outPath, img)
+	gl.DeleteShader(vs)
+	gl.DeleteShader(fs)
+	return prog
 }
 
+func compileShader(src string, typ uint32) uint32 {
+	shader := gl.CreateShader(typ)
+	csources, free := gl.Strs(src + "\x00")
+	gl.ShaderSource(shader, 1, csources, nil)
+	free()
+	gl.CompileShader(shader)
 
-func blendAllFrames() error {
-	files, err := os.ReadDir(inputFrameDir)
-	if err != nil {
-		return err
+	var status int32
+	gl.GetShaderiv(shader, gl.COMPILE_STATUS, &status)
+	if status == gl.FALSE {
+		var logLength int32
+		gl.GetShaderiv(shader, gl.INFO_LOG_LENGTH, &logLength)
+		log := make([]byte, logLength+1)
+		gl.GetShaderInfoLog(shader, logLength, nil, &log[0])
+		panic(fmt.Sprintf("Shader compile error: %s", log))
 	}
-	for i, f := range files {
-		if f.IsDir() || !strings.HasSuffix(f.Name(), ".png") {
-			continue
-		}
-		framePath := filepath.Join(inputFrameDir, f.Name())
-		shaderPath := filepath.Join(shaderFrameDir, fmt.Sprintf("shader_%04d.png", i+1))
-		outputPath := filepath.Join(blendedDir, fmt.Sprintf("blend_%04d.png", i+1))
-
-		src, err1 := loadImage(framePath)
-		shd, err2 := loadImage(shaderPath)
-		if err1 != nil || err2 != nil {
-			return fmt.Errorf("error loading: %v / %v", err1, err2)
-		}
-		blended := blendImages(src, shd)
-		if err := saveImage(outputPath, blended); err != nil {
-			return err
-		}
-	}
-	return nil
+	return shader
 }
 
-func getFrameSize() (int, int, error) {
-	files, err := os.ReadDir(inputFrameDir)
-	if err != nil || len(files) == 0 {
-		return 0, 0, fmt.Errorf("no frames found")
+func readPixels(w, h int) image.Image {
+	data := make([]uint8, w*h*4)
+	gl.ReadPixels(0, 0, int32(w), int32(h), gl.RGBA, gl.UNSIGNED_BYTE, gl.Ptr(data))
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		copy(img.Pix[y*w*4:(y+1)*w*4], data[(h-1-y)*w*4:(h-y)*w*4]) // Flip Y
 	}
-	img, err := loadImage(filepath.Join(inputFrameDir, files[0].Name()))
-	if err != nil {
-		return 0, 0, err
-	}
-	b := img.Bounds()
-	return b.Dx(), b.Dy(), nil
-}
-
-func clampToByte(val float64) uint8 {
-	if val < 0 {
-		return 0
-	}
-	if val > 255 {
-		return 255
-	}
-	return uint8(val)
+	return img
 }
